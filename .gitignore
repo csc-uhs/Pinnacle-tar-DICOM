@@ -1,2 +1,8 @@
 
 *.pyc
+__pycache__
+pinnacle_tar_dicom.egg-info
+
+# Virtual Environment files
+.venv/*
+venv/*

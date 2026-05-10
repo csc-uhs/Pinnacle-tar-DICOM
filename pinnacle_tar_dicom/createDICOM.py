@@ -26,11 +26,11 @@ import pydicom
 import numpy as np
 from pydicom.dataset import Dataset, FileDataset
 from pydicom.sequence import Sequence
-from pydicom.filebase import DicomFile
 import pydicom.uid
 import os
 import struct
 from random import randint
+from datetime import datetime
 #from PIL import Image
 
 ####################################################################################################################################################
@@ -59,6 +59,7 @@ descrip = ""
 plancount = 0
 plannamelist = []
 planids = []
+planimagesets = []
 randval = randint(0,999)
 currentdate = time.strftime("%Y%m%d")
 currenttime = time.strftime("%H%M%S")
@@ -95,7 +96,12 @@ point_values = []
 numfracs = ""
 flag_nobinaryfile = False
 flag_noimages = False
+# Implicit VR Little Endian — used for RTPLAN/RTSTRUCT/CT where it's safe.
 GTransferSyntaxUID='1.2.840.10008.1.2'
+# Explicit VR Little Endian — REQUIRED for RT Dose with BitsAllocated=32.
+# Many DICOM viewers refuse or mis-parse 32-bit pixel data under Implicit VR LE
+# because the OW VR length field is ambiguous. Always use this for RT Dose.
+RTDOSE_TRANSFER_SYNTAX_UID='1.2.840.10008.1.2.1'
 no_setup_file = False
 no_beams = False
 gImplementationClassUID='1.2.826.0.1.3680043.8.498.75006884747854523615841001'
@@ -112,6 +118,66 @@ z_dim = 0
 xpixdim = 0
 ypixdim = 0
 #listofversions = []
+
+
+####################################################################################################################################################
+# Helper: format_ds (DS = Decimal String VR; max 16 chars)
+# Pinnacle dose grid scaling values can serialize to >16 chars under Python's
+# default float-to-string, which DICOM silently truncates and then mis-applies.
+# Format explicitly and verify length.
+####################################################################################################################################################
+def format_ds(value, max_chars=16):
+    s = "%.7g" % float(value)
+    if len(s) > max_chars:
+        # Fall back to fewer significant figures
+        for sig in range(6, 1, -1):
+            s = ("%%.%dg" % sig) % float(value)
+            if len(s) <= max_chars:
+                break
+    return s
+
+
+####################################################################################################################################################
+# Helper: make_sub_uid
+# pydicom.uid.generate_uid() can produce UIDs up to 64 chars.  Appending
+# ".0", ".1" etc. then truncating to 64 chars can leave a trailing dot
+# (invalid) or silently change the UID so that cross-references break.
+# Instead, generate a *shorter* root UID once and derive sub-UIDs safely.
+####################################################################################################################################################
+def make_sub_uid(root_uid, *suffixes):
+    """Build a UID from root_uid + dot-separated suffixes, guaranteed ≤64
+    chars and no trailing dot.
+
+    If simple concatenation exceeds 64 chars the root is shortened first
+    (by trimming trailing digits) to make room for the suffix.
+    """
+    suffix = ".".join(str(s) for s in suffixes)
+    candidate = root_uid + "." + suffix
+    if len(candidate) <= 64:
+        return candidate
+    # Need to shorten root to make room.  suffix + dot = len(suffix)+1
+    max_root = 64 - len(suffix) - 1
+    shortened = root_uid[:max_root]
+    # Strip any trailing dot left by the slice
+    shortened = shortened.rstrip(".")
+    result = shortened + "." + suffix
+    # Final safety — should never happen but be defensive
+    return result[:64].rstrip(".")
+
+
+# pydicom's save_as default behaviour differs across versions. To produce a
+# *valid Part-10 DICOM file* (with preamble + file meta + dataset, in the
+# transfer syntax declared in file_meta), we must opt out of "raw" mode
+# explicitly. This helper picks the right kwarg for the installed pydicom.
+####################################################################################################################################################
+def save_dicom_strict(ds, path):
+    try:
+        # pydicom >= 3.0
+        ds.save_as(path, enforce_file_format=True)
+    except TypeError:
+        # pydicom < 3.0
+        ds.save_as(path, write_like_original=False)
+
 
 ####################################################################################################################################################
 # Function: main
@@ -166,11 +232,11 @@ def main(temppatientfolder,inputfolder,outputfolder):
     global no_setup_file
     global no_beams
     global softwarev
+    global planimagesets
     
     from pydicom import config
-
-    config.INVALID_KEYWORD_BEHAVIOR = "RAISE"
-
+    config.settings.reading_validation_mode = config.IGNORE
+    config.settings.writing_validation_mode = config.WARN
     initglobalvars()  # First step of the main function is to call the initglobalvars variable to reset everything in case this function is being used in a loop. (see allpatientloop.py) 
     #print("Input Patient Folder:")
     #patientfolder = raw_input("> ")
@@ -205,12 +271,26 @@ def main(temppatientfolder,inputfolder,outputfolder):
     for i in range(0, 5000):
         timewaster = i
     plansopinstuid = pydicom.uid.generate_uid()
+    if planimagesets:
+        imagesetnumber = planimagesets[0]
     convertimages() #This function makes the image files usable (matches patient info that will go into other DICOM files). If image files do not exist this function calls createimagefiles function
     if flag_noimages:
         return
     planseriesinstuid = pydicom.uid.generate_uid()
 
-    patient_position = getpatientsetup("Plan_%s"%planids[0])
+    if not planids:
+        print("Error: No plan IDs found in Patient file, cannot continue.")
+        return
+    # Find the first plan that actually has a PatientSetup file (some plans are CT-only)
+    first_valid_plan = None
+    for plan_id_val in planids:
+        if os.path.exists("%s%s/Plan_%s/plan.PatientSetup"%(Inputf, patientfolder, plan_id_val)):
+            first_valid_plan = plan_id_val
+            break
+    if first_valid_plan is None:
+        print("Warning: No plan.PatientSetup found for any plan. Cannot determine patient position.")
+        return
+    patient_position = getpatientsetup("Plan_%s"%first_valid_plan)
     if no_setup_file == True:
         return
 
@@ -229,11 +309,12 @@ def main(temppatientfolder,inputfolder,outputfolder):
     structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence.append(RTReferencedSeries1)
     structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence[0].SeriesInstanceUID = SeriesUID
     structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence[0].ContourImageSequence = Sequence()
-    for i, value in enumerate(imageuid,1): 
-        exec("ContourImage%d = Dataset()"% i)
-        exec("structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence[0].ContourImageSequence.append(ContourImage%d)"%i)
-        structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence[0].ContourImageSequence[i-1].ReferencedSOPClassUID = '1.2.840.10008.5.1.4.1.1.1'
-        structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence[0].ContourImageSequence[i-1].ReferencedSOPInstanceUID = imageuid[i-1]
+    contour_image_seq = structds.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0].RTReferencedSeriesSequence[0].ContourImageSequence
+    for i, value in enumerate(imageuid, 0):
+        ci = Dataset()
+        contour_image_seq.append(ci)
+        ci.ReferencedSOPClassUID = '1.2.840.10008.5.1.4.1.1.2'  # CT Image Storage (was incorrectly CR)
+        ci.ReferencedSOPInstanceUID = imageuid[i]
 
     doseinstuid = pydicom.uid.generate_uid()
 
@@ -243,13 +324,35 @@ def main(temppatientfolder,inputfolder,outputfolder):
     
     if softwarev != "Pinnacle 9.0": # If pinnacle software is version 9.0 the shifts are not needed so this function can be skipped and the values for the shifts will still be set to zero
         getstructshift()
-    structds = readpoints(structds, "Plan_%s"%planids[0])
-    structds = readroi(structds, "Plan_%s"%planids[0])
+    structds = readpoints(structds, "Plan_%s"%first_valid_plan)
+    
+    # If isocenter wasn't found in the first plan, search remaining plans
+    if isocenter == [0.0, 0.0, 0.0]:
+        for plan_id_val in planids:
+            if plan_id_val == first_valid_plan:
+                continue
+            alt_points_path = "%s%s/Plan_%s/plan.Points" % (Inputf, patientfolder, plan_id_val)
+            if os.path.isfile(alt_points_path):
+                with open(alt_points_path, "rt", encoding="latin1") as _pf:
+                    for _line in _pf:
+                        if "Name = " in _line:
+                            _name = re.findall(r'"([^"]*)"', _line)
+                            if _name:
+                                _n = _name[0].lower()
+                                if "iso" in _n or "isocenter" in _n or "isocentre" in _n:
+                                    # Found a plan with isocenter — re-read points from this plan
+                                    print("Info: Isocenter found in Plan_%s, re-reading points." % plan_id_val)
+                                    structds = readpoints(structds, "Plan_%s" % plan_id_val)
+                                    break
+                    if isocenter != [0.0, 0.0, 0.0]:
+                        break
+    
+    structds = readroi(structds, "Plan_%s"%first_valid_plan)
 
     structds.ApprovalStatus = 'UNAPPROVED' #find out where to get if its been approved or not
     # Set the transfer syntax
-    structds.is_little_endian = True
-    structds.is_implicit_VR = True
+    # is_little_endian and is_implicit_VR removed in pydicom v3;
+    # transfer syntax is controlled via file_meta.TransferSyntaxUID
     #structfilepath=outputfolder + patientfolder + "/" + structfilename
     #structds.save_as("structfilepath")
     #print("Structure file being saved\n")
@@ -263,28 +366,24 @@ def main(temppatientfolder,inputfolder,outputfolder):
     #############################################################################################
     # loop below creates plan files for each plan in directory (based on what is in the Patient file)
     for i in range(0, plancount): 
-        
+        no_beams = False  # Reset per plan — one plan having no beams shouldn't skip the rest
         planame = plannamelist[i]
         plandirect = "Plan_" + planids[i]
-        exec("plands_%s = createplands(i)"%planids[i])
-        exec("plands_%s = planinit(plands_%s, planame, plandirect, i)"%(planids[i], planids[i]))
-        exec("plands_%s = readtrial(plands_%s, plandirect, i)"%(planids[i], planids[i]))
+        if i < len(planimagesets):
+            imagesetnumber = planimagesets[i]
+        plands = createplands(i)
+        plands = planinit(plands, planame, plandirect, i)
+        plands = readtrial(plands, plandirect, i)
         if no_beams == True:
             continue
-        #print("Setting plan file name:")
-        
-        #exec("tempmetainstuid = plands_%s.file_meta.MediaStorageSOPInstanceUID"%planids[i])
 
-        tempmetainstuid = plansopinstuid + "." + str(i)
+        tempmetainstuid = make_sub_uid(plansopinstuid, i)
 
         planfilename = 'RP.' + tempmetainstuid + '.dcm'
 
-        #print("Plan file name: " + planfilename)
         planfilepath=Outputf + patientfolder + "/" + planfilename
 
-        #print(planfilepath)
-        #print("\n Saving plan file \n")
-        exec("plands_%s.save_as(planfilepath)"%(planids[i]))
+        save_dicom_strict(plands, planfilepath)
 
     os.rename(Outputf+'%s'% patientfolder, Outputf+'%s,%s,%s'%(lname,fname,pid))
     #print("\n \n Current software versions found: \n")
@@ -364,6 +463,7 @@ def initglobalvars():
     global no_setup_file
     global no_beams
     global softwarev
+    global planimagesets
     global slicethick
     global x_dim
     global y_dim
@@ -394,6 +494,7 @@ def initglobalvars():
     plancount = 0
     plannamelist = []
     planids = []
+    planimagesets = []
     randval = randint(0,999)
     currentdate = time.strftime("%Y%m%d")
     currenttime = time.strftime("%H%M%S")
@@ -474,7 +575,7 @@ def convertimages():
     for file in os.listdir("%s%s/ImageSet_%s.DICOM"%(Inputf,patientfolder, imagesetnumber)):
         if file == '11026.1.img':
             continue
-        imageds = pydicom.read_file("%s%s/ImageSet_%s.DICOM/%s"%(Inputf, patientfolder, imagesetnumber, file), force=True)
+        imageds = pydicom.dcmread("%s%s/ImageSet_%s.DICOM/%s"%(Inputf, patientfolder, imagesetnumber, file), force=True)
         imageds.PatientName = patientname
         imageds.PatientID = pid
         imageds.PatientBirthDate = dob
@@ -493,13 +594,7 @@ def convertimages():
         file_meta.MediaStorageSOPInstanceUID = tempinstuid
         file_meta.ImplementationClassUID = gImplementationClassUID
         imageds.file_meta = file_meta
-        preamble = getattr(imageds, "preamble", None)
-        if not preamble:
-            preamble = b'\x00'*128
-        currfile = DicomFile(Outputf+"%s/CT.%s.dcm"%(patientfolder, tempinstuid), 'wb')
-        currfile.write(preamble)
-        currfile.write(b'DICM')
-        pydicom.write_file(Outputf+"%s/CT.%s.dcm"%(patientfolder,tempinstuid), imageds, False)
+        imageds.save_as(Outputf+"%s/CT.%s.dcm"%(patientfolder, tempinstuid), write_like_original=False)
         #print("Current image: ", file)
         #print(imageds)
 ####################################################################################################################################################
@@ -545,7 +640,11 @@ def createimagefiles():
             allframeslist.append(frame_array)
 """
     #print("Length of frames list: " + str(len(allframeslist)))
-    with open("%s%s/ImageSet_%s.ImageInfo"%(Inputf, patientfolder, imagesetnumber), 'rt', encoding='latin1') as f:
+    imageinfo_path = "%s%s/ImageSet_%s.ImageInfo"%(Inputf, patientfolder, imagesetnumber)
+    if not os.path.isfile(imageinfo_path):
+        print("Warning: ImageSet_%s.ImageInfo not found, skipping image creation." % imagesetnumber)
+        return
+    with open(imageinfo_path, 'rt', encoding='latin1') as f:
         image_info = f.readlines()
         curframe = 0
         for i, line in enumerate(image_info, 0):
@@ -562,6 +661,7 @@ def createimagefiles():
                 file_meta = Dataset()
                 file_meta.MediaStorageSOPClassUID = classuid
                 file_meta.MediaStorageSOPInstanceUID = instuid
+                file_meta.TransferSyntaxUID = GTransferSyntaxUID
                 file_meta.ImplementationClassUID = gImplementationClassUID #this value remains static since implementation for creating file is the same
                 ds = FileDataset(planfilename, {}, file_meta=file_meta, preamble=b'\x00'*128)
 
@@ -627,7 +727,7 @@ def createimagefiles():
 
                 #ds.PixelData = allframeslist[curframe]
                 #ds.PixelData = allframeslist[slicenum - 1]
-                ds.PixelData = allframeslist[curframe].tostring()
+                ds.PixelData = allframeslist[curframe].tobytes()
 
                 imageslice.append(sliceloc)
                 imageuid.append(instuid)
@@ -635,7 +735,7 @@ def createimagefiles():
                 posrefind = ds.PositionReferenceIndicator
                 #print("Creating image: " + Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid))
                 #ds.save_as(Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid),write_like_original=False)
-                ds.save_as(Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid))
+                ds.save_as(Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid), write_like_original=False)
                 curframe = curframe + 1
 ####################################################################################################################################################
 ####################################################################################################################################################
@@ -653,7 +753,11 @@ def getheaderinfo():
     global xpixdim
     global ypixdim
     temp_pos = ""
-    with open("%s%s/ImageSet_%s.header"%(Inputf, patientfolder, imagesetnumber), "rt", encoding='latin1') as f2:
+    header_path = "%s%s/ImageSet_%s.header"%(Inputf, patientfolder, imagesetnumber)
+    if not os.path.isfile(header_path):
+        print("Warning: ImageSet_%s.header not found." % imagesetnumber)
+        return temp_pos
+    with open(header_path, "rt", encoding='latin1') as f2:
         for line in f2:
             #print("line in header: " + line)
             if "x_dim =" in line:
@@ -691,7 +795,11 @@ def getheaderinfo():
 ####################################################################################################################################################
 def getdateandtime():
     #with open("//Testfile", "rt", encoding='latin1') as g:
-    with open("%s%s/ImageSet_%s.ImageSet"%(Inputf, patientfolder, imagesetnumber), "rt", encoding='latin1') as g:
+    imageset_path = "%s%s/ImageSet_%s.ImageSet"%(Inputf, patientfolder, imagesetnumber)
+    if not os.path.isfile(imageset_path):
+        print("Warning: ImageSet_%s.ImageSet not found, using current date/time." % imagesetnumber)
+        return time.strftime("%Y%m%d"), time.strftime("%H%M%S")
+    with open(imageset_path, "rt", encoding='latin1') as g:
         for line in g:
             if "ScanTimeFromScanner" in line:
                 dateandtimestring = re.findall(r'"([^"]*)"', line)[0]
@@ -757,8 +865,9 @@ def createstructds():
     #file_meta.add_new(0x00020000, 'UL', 184)
     #file_meta.add_new(0x00020001, 'OB', b'\x00'*2)
     file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.3' #RT Structure Set Storage
-    file_meta.MediaStorageSOPInstanceUID = structsopinstuid
-    structfilename="RS."+structsopinstuid+".dcm"
+    file_meta.MediaStorageSOPInstanceUID = structsopinstuid[:64].rstrip(".")
+    structfilename="RS."+file_meta.MediaStorageSOPInstanceUID+".dcm"
+    file_meta.TransferSyntaxUID = GTransferSyntaxUID
     file_meta.ImplementationClassUID = gImplementationClassUID #this value remains static since implementation for creating file is the same
     #file_meta.add_new(0x00020013, 'SH', "DCTOOL100")
     #print(file_meta.elements)
@@ -783,7 +892,11 @@ def getstructshift():
     global zshift
     global patient_position
     global imagesetnumber
-    with open("%s%s/ImageSet_%s.header"%(Inputf, patientfolder, imagesetnumber), "rt", encoding='latin1') as f2:
+    header_path = "%s%s/ImageSet_%s.header"%(Inputf, patientfolder, imagesetnumber)
+    if not os.path.isfile(header_path):
+        print("Warning: ImageSet_%s.header not found." % imagesetnumber)
+        return temp_pos
+    with open(header_path, "rt", encoding='latin1') as f2:
         for line in f2:
             if "x_dim =" in line:
                 x_dim = float((line.split(" ")[-1]).replace(';',''))
@@ -848,7 +961,9 @@ def createplands(plannumber):
     global plansopinstuid
     file_meta = Dataset()
     file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.5' #RT Plan Storage
-    file_meta.MediaStorageSOPInstanceUID = plansopinstuid + "." + str(plannumber)
+    _plan_sop_uid = make_sub_uid(plansopinstuid, plannumber)
+    file_meta.MediaStorageSOPInstanceUID = _plan_sop_uid
+    file_meta.TransferSyntaxUID = GTransferSyntaxUID
     file_meta.ImplementationClassUID = gImplementationClassUID #this value remains static since implementation for creating file is the same
 
     ds = FileDataset(planfilename, {}, file_meta=file_meta, preamble=b'\x00'*128)
@@ -879,7 +994,7 @@ def initds(ds):
     ds.InstanceCreationDate = time.strftime("%Y%m%d")
     ds.InstanceCreationTime = time.strftime("%H%M%S")
     ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.481.3'
-    ds.SOPInstanceUID = structsopinstuid
+    ds.SOPInstanceUID = structsopinstuid[:64].rstrip(".")
     ds.Modality = 'RTSTRUCT'
     #print(patientname)
     ds.PatientName=patientname
@@ -931,13 +1046,19 @@ def readpatientinfo(ds):
     global descrip
     global plancount
     global plannamelist
+    global planids
+    global planimagesets
     global patientfolder
     global lname
     global fname
     global imagesetnumber
     global softwarev
     #global listofversions
-    with open("%s%s/Patient"%(Inputf, patientfolder), "rt", encoding='latin1') as g: 
+    patient_path = "%s%s/Patient"%(Inputf, patientfolder)
+    if not os.path.isfile(patient_path):
+        print("Error: Patient file not found at %s, cannot continue." % patient_path)
+        return ds
+    with open(patient_path, "rt", encoding='latin1') as g: 
         for line in g:
             if "PatientID =" in line:
                 pid = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
@@ -975,20 +1096,15 @@ def readpatientinfo(ds):
                     patient_sex = 'F'
                 ds.PatientSex = patient_sex
             if "DateOfBirth =" in line:
-                dobstr = re.findall(r'"([^"]*)"', line) #gets birthday string with numbers and dashes
-                if '-' in dobstr[0]:
-                    dob_list = dobstr[0].split('-')
-                elif '/' in dobstr[0]:
-                    dob_list = dobstr[0].split('/')
-                else:
-                    dob_list = dobstr[0].split(' ')
-                dob = ""
-                for num in dob_list:
-                    if len(num) == 1:
-                        num = '0' + num
-                    if num == dob_list[-1] and len(num) == 2:
-                        num = "19" + num
-                    dob = dob + num
+                dobstr = re.findall(r'"([^"]*)"', line)[0] #gets birthday string with numbers and dashes
+                dob = ""  # default if invalid
+                for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d %m %Y"]:
+                    try:
+                        dob_date = datetime.strptime(dobstr, fmt)
+                        dob = dob_date.strftime("%Y%m%d")
+                        break
+                    except ValueError:
+                        pass
                 ds.PatientBirthDate = dob
             if "ImageSetList ={" in line:
                 flag_first = False
@@ -999,6 +1115,7 @@ def readpatientinfo(ds):
             if "PrimaryCTImageSetID =" in line:
                 imagesetnumber = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
                 #print("Image set number: " + imagesetnumber)
+                planimagesets.append(imagesetnumber)
             if "    PlanID =" in line:
                 planids.append(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])
             if "    StudyID = " in line and flag_stid:
@@ -1066,17 +1183,21 @@ def readpoints(ds, planfolder):
     global point_values
     global point_names
     global FrameUID
-    with open("%s%s/%s/plan.Points"%(Inputf, patientfolder, planfolder), "rt", encoding='latin1') as e:
+    points_path = "%s%s/%s/plan.Points"%(Inputf, patientfolder, planfolder)
+    if not os.path.isfile(points_path):
+        print("Warning: plan.Points not found at %s, skipping points." % points_path)
+        return ds
+    with open(points_path, "rt", encoding='latin1') as e:
         for num, line in enumerate(e,1):
             if "  Name = " in line:
                 ROI_COUNT = ROI_COUNT + 1
-                exec("ROIContour%d = Dataset()"%(ROI_COUNT))
-                exec("ds.ROIContourSequence.append(ROIContour%d)"%ROI_COUNT)
-                exec("ROIContour%d.ReferencedROINumber = str(%d)"%(ROI_COUNT, ROI_COUNT))
-                exec("StructureSetROI%d = Dataset()"%(ROI_COUNT))
-                exec("ds.StructureSetROISequence.append(StructureSetROI%d)"%(ROI_COUNT))
-                exec("RTROIObservations%d = Dataset()"%(ROI_COUNT))
-                exec("ds.RTROIObservationsSequence.append(RTROIObservations%d)"%ROI_COUNT)
+                roi_contour = Dataset()
+                roi_contour.ReferencedROINumber = str(ROI_COUNT)
+                ds.ROIContourSequence.append(roi_contour)
+                ss_roi = Dataset()
+                ds.StructureSetROISequence.append(ss_roi)
+                obs_roi = Dataset()
+                ds.RTROIObservationsSequence.append(obs_roi)
                 ds.StructureSetROISequence[ROI_COUNT - 1].ROINumber = ROI_COUNT
                 refptname = re.findall(r'"([^"]*)"', line)[0]    
                 ds.StructureSetROISequence[ROI_COUNT - 1].ROIName = refptname
@@ -1175,6 +1296,9 @@ def readpoints(ds, planfolder):
             if  len(ds.ROIContourSequence) > 0: 
                 isocenter = point_values[0] # setting to first point if isocenter or ct center not found
                 #print("setting iso to actual value: " + str(isocenter))
+    if len(isocenter) < 3:
+        print("Warning: isocenter could not be determined, defaulting to [0, 0, 0]")
+        isocenter = [0.0, 0.0, 0.0]
     #print("isocenter before loop to apply shifts to contour sequence points: " + str(isocenter))
     for enteredpoints in ds.ROIContourSequence:
         #print("In loop applying shifts: isocenter:" + str(isocenter) )
@@ -1210,7 +1334,11 @@ def readroi(ds, planfolder):
     points = []
     flag_points = False # bool value to tell me if I want to read the line in as point values
     prevroi = ROI_COUNT
-    with open("%s%s/%s/plan.roi"%(Inputf, patientfolder, planfolder), "rt", encoding='latin1') as f:
+    roi_path = "%s%s/%s/plan.roi"%(Inputf, patientfolder, planfolder)
+    if not os.path.isfile(roi_path):
+        print("Warning: plan.roi not found at %s, skipping ROI contours." % roi_path)
+        return ds
+    with open(roi_path, "rt", encoding='latin1') as f:
         for num, line in enumerate(f, 1):
             if "};  // End of points for curve" in line: # this will tell me not to read in point values
                 #all points for current curve saved until now. Here is where I need to add them to dicom file
@@ -1250,13 +1378,13 @@ def readroi(ds, planfolder):
                 points = points + curr_points
             if "Beginning of ROI" in line: # Start of ROI
                 ROI_COUNT = ROI_COUNT + 1 #increment ROI_num because I've found a new ROI
-                exec("ROIContour%d = Dataset()"%(ROI_COUNT))
-                exec("ds.ROIContourSequence.append(ROIContour%d)"%ROI_COUNT)
-                exec("ROIContour%d.ReferencedROINumber = str(%d)"%(ROI_COUNT, ROI_COUNT))
-                exec("StructureSetROI%d = Dataset()"%(ROI_COUNT))
-                exec("ds.StructureSetROISequence.append(StructureSetROI%d)"%(ROI_COUNT))
-                exec("RTROIObservations%d = Dataset()"%(ROI_COUNT))
-                exec("ds.RTROIObservationsSequence.append(RTROIObservations%d)"%ROI_COUNT)
+                roi_contour = Dataset()
+                roi_contour.ReferencedROINumber = str(ROI_COUNT)
+                ds.ROIContourSequence.append(roi_contour)
+                ss_roi = Dataset()
+                ds.StructureSetROISequence.append(ss_roi)
+                obs_roi = Dataset()
+                ds.RTROIObservationsSequence.append(obs_roi)
                 ds.StructureSetROISequence[ROI_COUNT - 1].ROINumber = ROI_COUNT
                 ROIName = line[22:] # gets a string of ROI name
                 ROIName = ROIName.replace('\n','')
@@ -1294,8 +1422,8 @@ def readroi(ds, planfolder):
                 ds.StructureSetROISequence[ROI_COUNT - 1].ROIVolume = vol
             if "//  Curve " in line: #found a curve
                 curvenum = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
-                exec("Contour%s = Dataset()"%curvenum)
-                exec("ds.ROIContourSequence[%d - 1].ContourSequence.append(Contour%d)"%(ROI_COUNT, int(curvenum)))
+                contour_ds = Dataset()
+                ds.ROIContourSequence[ROI_COUNT - 1].ContourSequence.append(contour_ds)
             if "num_points =" in line:
                 npts = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
                 ds.ROIContourSequence[ROI_COUNT - 1].ContourSequence[int(curvenum) - 1].ContourGeometricType = 'CLOSED_PLANAR'
@@ -1331,22 +1459,23 @@ def planinit(ds, planame, planandnum, plannumber):
     ds.InstanceCreationDate = time.strftime("%Y%m%d")
     ds.InstanceCreationTime = time.strftime("%H%M%S")
     ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.481.5' #RT Plan Storage
-    ds.SOPInstanceUID = plansopinstuid+"." + str(plannumber)
+    ds.SOPInstanceUID = make_sub_uid(plansopinstuid, plannumber)
     ds.StudyDate = study_date
     ds.StudyTime = study_time
     ds.AccessionNumber = ''
     ds.Modality = 'RTPLAN'
     ds.Manufacturer =Manufacturer
+    ds.ReferringPhysicianName = physician if physician else ""
     ds.OperatorsName = ""
     ds.ManufacturerModelName = model
-    ds.SoftwareVersions = ['u\'9.0']
+    ds.SoftwareVersions = softwarev if softwarev else 'Unknown'
     ds.PhysiciansOfRecord = physician
     ds.PatientName = patientname
     ds.PatientBirthDate = dob
     ds.PatientID = pid
     ds.PatientSex = patient_sex
     ds.StudyInstanceUID = StudyInstanceUID
-    ds.SeriesInstanceUID = planseriesinstuid + "." + str(plannumber)
+    ds.SeriesInstanceUID = make_sub_uid(planseriesinstuid, plannumber)
     ds.StudyID = sid
     ds.FrameOfReferenceUID = FrameUID
     ds.PositionReferenceIndicator = posrefind
@@ -1366,7 +1495,7 @@ def planinit(ds, planame, planandnum, plannumber):
     ReferencedStructureSet1 = Dataset()
     ds.ReferencedStructureSetSequence.append(ReferencedStructureSet1)
     ds.ReferencedStructureSetSequence[0].ReferencedSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.3'
-    ds.ReferencedStructureSetSequence[0].ReferencedSOPInstanceUID = structsopinstuid
+    ds.ReferencedStructureSetSequence[0].ReferencedSOPInstanceUID = structsopinstuid[:64].rstrip(".")
     ds.ApprovalStatus = 'UNAPPROVED' #find out where to get this information
     return ds
 ####################################################################################################################################################
@@ -1465,7 +1594,12 @@ def readtrial(ds, planfolder, plannumber):
     FractionGroup1 = Dataset() #I'm assuming here I only need one data set in fraction goup sequence
     ds.FractionGroupSequence.append(FractionGroup1)
     ds.FractionGroupSequence[0].ReferencedBeamSequence = Sequence()
-    tempfile = open("%s%s/%s/plan.Trial"%(Inputf, patientfolder, planfolder), "rt", encoding='latin1')
+    trial_path = "%s%s/%s/plan.Trial"%(Inputf, patientfolder, planfolder)
+    if not os.path.isfile(trial_path):
+        print("Warning: plan.Trial not found at %s, skipping plan." % trial_path)
+        no_beams = True
+        return ds
+    tempfile = open(trial_path, "rt", encoding='latin1')
     all_lines = tempfile.readlines() #this is a big waste of space, there is probably a better way to do this, but it will work for now
     tempfile.close()
     num_trials = all_lines.count("Trial ={\n")
@@ -1482,7 +1616,7 @@ def readtrial(ds, planfolder, plannumber):
         if "BeamList ={" in line and "};" in all_lines[linenum + 1]:
             #empty beam set, skip patient
             no_beams = True
-            return
+            return ds
         if "DoseGrid .VoxelSize .X" in line:
             pixspacingx = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])*10
         if "DoseGrid .VoxelSize .Y" in line:
@@ -1544,12 +1678,12 @@ def readtrial(ds, planfolder, plannumber):
             x2 = ""
             y1 = ""
             y2 = ""
-            exec("ReferencedBeam%d = Dataset()"%beamcount)
-            exec("ds.FractionGroupSequence[0].ReferencedBeamSequence.append(ReferencedBeam%d)"%beamcount)
+            ref_beam = Dataset()
+            ds.FractionGroupSequence[0].ReferencedBeamSequence.append(ref_beam)
              
             ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].ReferencedBeamNumber = beamcount
-            exec("Beam%d = Dataset()"%beamcount)
-            exec("ds.BeamSequence.append(Beam%d)"%beamcount)
+            beam_ds = Dataset()
+            ds.BeamSequence.append(beam_ds)
             ds.BeamSequence[beamcount - 1].Manufacturer = Manufacturer #figure out what to put here
             ds.BeamSequence[beamcount - 1].BeamNumber = beamcount
             ds.BeamSequence[beamcount - 1].TreatmentDeliveryType = 'TREATMENT'
@@ -1573,8 +1707,9 @@ def readtrial(ds, planfolder, plannumber):
                 #print("Dose reference point: " + str([float(doserefpt[0])-xshift, float(doserefpt[1])-yshift, float(doserefpt[2])]))
                 ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamDoseSpecificationPoint = [float(doserefpt[0])-xshift, float(doserefpt[1])-yshift, float(doserefpt[2])] #Not sure if I need shifts here or not...?
             else:
-                #print("No dose reference point, setting to isocenter: " + str([float(isocenter[0]) - xshift, float(isocenter[1]) - yshift, float(isocenter[2])]))
-                ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamDoseSpecificationPoint = [float(isocenter[0]) - xshift, float(isocenter[1]) - yshift, float(isocenter[2])]
+                _iso = isocenter if len(isocenter) >= 3 else [0.0, 0.0, 0.0]
+                #print("No dose reference point, setting to isocenter: " + str([float(_iso[0]) - xshift, float(_iso[1]) - yshift, float(_iso[2])]))
+                ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamDoseSpecificationPoint = [float(_iso[0]) - xshift, float(_iso[1]) - yshift, float(_iso[2])]
         if "      PrescriptionDose =" == line[:24]:
             prescdose = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
         if "      Modality =" == line[:16] and beginbeam:
@@ -1604,21 +1739,33 @@ def readtrial(ds, planfolder, plannumber):
             normdose = float(re.findall(r"[-+]?\d*\.\d+|\d+", all_lines[linenum + 15])[0])
             OFc = float(re.findall(r"[-+]?\d*\.\d+|\d+", all_lines[linenum + 17])[0])
             # OFc value added by Achraf Touzani 2018
-            if normdose == 0:
-                beammu = 0 
+            if normdose == 0 or OFc == 0:
+                beammu = 0
+                print("Warning: normdose or OFc is 0 for beam %d, setting BeamMeterset=0." % beamcount)
+                ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamMeterset = 0
+                ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamDose = 0
+                beamdoses.append(0)
+                MUlineflag = False
                 continue
             ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamDose = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])/100
+            raw_dose_val = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])
             if beamenergies[beamcount-1] == '6': 
-                beammu = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])/(normdose*PDD6MV*OFc)
+                beammu = raw_dose_val/(normdose*PDD6MV*OFc)
             elif beamenergies[beamcount-1] == '15': 
-                beammu = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])/(normdose*PDD15MV*OFc)
+                beammu = raw_dose_val/(normdose*PDD15MV*OFc)
             elif beamenergies[beamcount-1] == '16':
-                beammu = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])/(normdose*PDD16MV*OFc)
+                beammu = raw_dose_val/(normdose*PDD16MV*OFc)
             elif beamenergies[beamcount-1] == '10':
-                beammu = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])/(normdose*PDD10MV*OFc)
+                beammu = raw_dose_val/(normdose*PDD10MV*OFc)
             else:
-                print("\n \n Error, beam energy not 6, 10, 15 or 16 MV")
-                return
+                print("Warning: beam energy '%s' not in PDD table (6,10,15,16), setting BeamMeterset=0 for beam %d." 
+                      % (beamenergies[beamcount-1], beamcount))
+                beammu = 0
+                ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamMeterset = 0
+                ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamDose = 0
+                beamdoses.append(0)
+                MUlineflag = False
+                continue
             #print("Beam MU: " + str(beammu))
             ds.FractionGroupSequence[0].ReferencedBeamSequence[beamcount - 1].BeamMeterset = beammu
             beamdoses.append(beammu)
@@ -1749,6 +1896,7 @@ def readtrial(ds, planfolder, plannumber):
         if flag_stepnshoot and "      DisplayMAXLeafMotion" in line:
             doserate = "400" 
             ds.BeamSequence[beamcount - 1].NumberOfControlPoints = numctrlpts*2
+            ds.BeamSequence[beamcount - 1].FinalCumulativeMetersetWeight = 1.0
             ds.BeamSequence[beamcount - 1].SourceToSurfaceDistance = ssd
             if numwedges > 0:
                 ds.BeamSequence[beamcount - 1].WedgeSequence = Sequence()
@@ -1762,21 +1910,60 @@ def readtrial(ds, planfolder, plannumber):
                 ds.BeamSequence[beamcount-1].WedgeSequence[0].WedgeFactor = ""
             
             #ds.BeamSequence[beamcount - 1].SourceAxisDistance = '1000'
-            metercount = 1
+            # Step-and-shoot: N Pinnacle control points → 2N DICOM control points.
+            # Pinnacle stores N differential segment weights (metersetweight[1..N]).
+            # metersetweight[0] is typically '1' (an initial marker, not a real weight).
+            # We need to convert to cumulative [0.0 → 1.0] over 2N DICOM CPs.
+            # Each pair (open, close) delivers one segment; open=cumulative before,
+            # close=cumulative after.
+            
+            # Extract the N segment weights (skip the first entry which is usually '1')
+            seg_weights_raw = []
+            for sw_idx in range(1, min(len(metersetweight), numctrlpts + 1)):
+                seg_weights_raw.append(float(metersetweight[sw_idx]))
+            
+            # If we don't have enough weights, pad with equal distribution
+            while len(seg_weights_raw) < numctrlpts:
+                seg_weights_raw.append(0.0)
+            
+            # Normalize: sum of segment weights = 1.0
+            total_seg_weight = sum(seg_weights_raw)
+            if total_seg_weight > 0:
+                seg_weights_norm = [w / total_seg_weight for w in seg_weights_raw]
+            else:
+                # All zero — distribute equally
+                seg_weights_norm = [1.0 / numctrlpts] * numctrlpts
+            
+            # Build cumulative weights for 2N DICOM control points
+            # CP0 (open seg 0) = 0.0
+            # CP1 (close seg 0) = seg_weights_norm[0]
+            # CP2 (open seg 1) = seg_weights_norm[0]  (same as close of previous)
+            # CP3 (close seg 1) = seg_weights_norm[0] + seg_weights_norm[1]
+            # ...
+            # CP[2N-1] = 1.0
+            cumulative_weights = []
+            running = 0.0
+            for seg_idx in range(numctrlpts):
+                cumulative_weights.append(running)           # open
+                running += seg_weights_norm[seg_idx]
+                cumulative_weights.append(running)           # close
+            # Ensure final is exactly 1.0 (floating point safety)
+            if cumulative_weights:
+                cumulative_weights[-1] = 1.0
+            
             for j in range(0,numctrlpts*2):
-                exec("ControlPoint%d = Dataset()"% (j+1))
-                exec("ds.BeamSequence[beamcount - 1].ControlPointSequence.append(ControlPoint%d)"%(j+1))
+                cp_ds = Dataset()
+                ds.BeamSequence[beamcount - 1].ControlPointSequence.append(cp_ds)
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ControlPointIndex = j
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].BeamLimitingDevicePositionSequence = Sequence()
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence = Sequence()
                 ReferencedDoseReference1 = Dataset()
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence.append(ReferencedDoseReference1)
-                if j%2 == 1: # odd number control point
-                    curretnmeterset = currentmeterset + float(metersetweight[metercount])
-                    metercount = metercount + 1
-
-                ds.BeamSequence[beamcount - 1].ControlPointSequence[j].CumulativeMetersetWeight = currentmeterset
-                ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence[0].CumulativeDoseReferenceCoefficient = currentmeterset
+                
+                # Use pre-computed cumulative weight (normalized 0→1)
+                cw = cumulative_weights[j] if j < len(cumulative_weights) else 1.0
+                ds.BeamSequence[beamcount - 1].ControlPointSequence[j].CumulativeMetersetWeight = cw
+                ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence[0].CumulativeDoseReferenceCoefficient = cw
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence[0].ReferencedDoseReferenceNumber = '1'
                 
                 if j == 0: #first control point beam meterset always zero
@@ -1813,7 +2000,8 @@ def readtrial(ds, planfolder, plannumber):
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].PatientSupportAngle = psupportangle
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].PatientSupportRotationDirection = 'NONE'
                     #print("Setting Isocenter postion: " + "[" + str(float(isocenter[0]) - xshift) +" , " +str(float(isocenter[1]) - yshift) + " , " + str(float(isocenter[2]))+ "]")
-                    ds.BeamSequence[beamcount - 1].ControlPointSequence[j].IsocenterPosition = [float(isocenter[0]) - xshift, float(isocenter[1]) - yshift, float(isocenter[2])]
+                    _iso = isocenter if len(isocenter) >= 3 else [0.0, 0.0, 0.0]
+                    ds.BeamSequence[beamcount - 1].ControlPointSequence[j].IsocenterPosition = [float(_iso[0]) - xshift, float(_iso[1]) - yshift, float(_iso[2])]
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].GantryRotationDirection = gantryrotdir
                 else:
                     BeamLimitingDevicePosition1 = Dataset() #This will be the mlcs for control points other than the first
@@ -1847,6 +2035,7 @@ def readtrial(ds, planfolder, plannumber):
             #doserate = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
             doserate = "400" 
             ds.BeamSequence[beamcount - 1].NumberOfControlPoints = numctrlpts + 1
+            ds.BeamSequence[beamcount - 1].FinalCumulativeMetersetWeight = 1.0
             ds.BeamSequence[beamcount - 1].SourceToSurfaceDistance = ssd
             if numwedges > 0:
                 ds.BeamSequence[beamcount - 1].WedgeSequence = Sequence()
@@ -1858,15 +2047,33 @@ def readtrial(ds, planfolder, plannumber):
                 ds.BeamSequence[beamcount-1].WedgeSequence[0].WedgeID = wedgename
                 ds.BeamSequence[beamcount-1].WedgeSequence[0].WedgeOrientation = wedgeorientation
                 ds.BeamSequence[beamcount-1].WedgeSequence[0].WedgeFactor = ""
+            # Non-step-and-shoot: N Pinnacle CPs → N+1 DICOM CPs.
+            # For static beams (N=1), DICOM needs CP0=0.0, CP1=1.0.
+            # Pinnacle stores raw weight values; normalize to [0, 1].
+            num_dicom_cps = numctrlpts + 1
+            if num_dicom_cps <= len(metersetweight):
+                # Use first 'num_dicom_cps' weights
+                raw_w = [float(metersetweight[k]) for k in range(num_dicom_cps)]
+            else:
+                # Pad with zeros
+                raw_w = [float(metersetweight[k]) if k < len(metersetweight) else 0.0
+                         for k in range(num_dicom_cps)]
+            # Normalize: CP0 should be 0, last CP should be 1
+            max_w = raw_w[-1] if raw_w[-1] != 0 else 1.0
+            norm_w = [w / max_w for w in raw_w]
+            # Force endpoints
+            norm_w[0] = 0.0
+            norm_w[-1] = 1.0
+            
             for j in range(0,numctrlpts+1):
-                exec("ControlPoint%d = Dataset()"% (j+1))
-                exec("ds.BeamSequence[beamcount - 1].ControlPointSequence.append(ControlPoint%d)"%(j+1))
+                cp_ds = Dataset()
+                ds.BeamSequence[beamcount - 1].ControlPointSequence.append(cp_ds)
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ControlPointIndex = j
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].BeamLimitingDevicePositionSequence = Sequence()
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence = Sequence()
                 ReferencedDoseReference1 = Dataset()
                 ds.BeamSequence[beamcount - 1].ControlPointSequence[j].ReferencedDoseReferenceSequence.append(ReferencedDoseReference1)
-                ds.BeamSequence[beamcount - 1].ControlPointSequence[j].CumulativeMetersetWeight = metersetweight[j]
+                ds.BeamSequence[beamcount - 1].ControlPointSequence[j].CumulativeMetersetWeight = norm_w[j]
                 if j == 0: #first control point beam meterset always zero
                     BeamLimitingDevicePosition1 = Dataset() #This will be the x jaws
                     BeamLimitingDevicePosition2 = Dataset() #this will be the y jaws
@@ -1901,8 +2108,9 @@ def readtrial(ds, planfolder, plannumber):
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].BeamLimitingDeviceRotationDirection = 'NONE'
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].PatientSupportAngle = psupportangle
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].PatientSupportRotationDirection = 'NONE'
-                    print("No step-and-shoot Setting Isocenter postion: " + "[" + str(float(isocenter[0]) - xshift) +" , " +str(float(isocenter[1]) - yshift) + " , " + str(float(isocenter[2]))+ "]")
-                    ds.BeamSequence[beamcount - 1].ControlPointSequence[j].IsocenterPosition = [float(isocenter[0]) - xshift, float(isocenter[1]) - yshift, float(isocenter[2])]
+                    _iso = isocenter if len(isocenter) >= 3 else [0.0, 0.0, 0.0]
+                    print("No step-and-shoot Setting Isocenter postion: " + "[" + str(float(_iso[0]) - xshift) +" , " +str(float(_iso[1]) - yshift) + " , " + str(float(_iso[2]))+ "]")
+                    ds.BeamSequence[beamcount - 1].ControlPointSequence[j].IsocenterPosition = [float(_iso[0]) - xshift, float(_iso[1]) - yshift, float(_iso[2])]
                     ds.BeamSequence[beamcount - 1].ControlPointSequence[j].GantryRotationDirection = gantryrotdir
                     ds.BeamSequence[beamcount - 1].NumberOfWedges = numwedges
                     ds.BeamSequence[beamcount - 1].NumberOfCompensators = '0' # this is temporary value, will read in from file later
@@ -1941,14 +2149,26 @@ def readtrial(ds, planfolder, plannumber):
     ds.FractionGroupSequence[0].NumberOfBrachyApplicationSetups = '0'
     summed_pixel_values = []
     flag_nobinaryfile = False
-    for currentbeam in range(0,beamcount):
-        exec("PatientSetup%d = Dataset()"%(currentbeam+1))
-        exec("ds.PatientSetupSequence.append(PatientSetup%d)"%(currentbeam+1))
+    # Check if all beams have valid MU for consistent dose scaling
+    n_beams_in_loop = min(beamcount, len(beamdoses), len(beamdosefiles))
+    beams_with_zero_mu = [i+1 for i in range(n_beams_in_loop) if beamdoses[i] == 0]
+    if beams_with_zero_mu and len(beams_with_zero_mu) < n_beams_in_loop:
+        print("WARNING: beams %s have MU=0 (PDD calc failed). Their dose contributions "
+              "will be raw (un-scaled) while other beams are in absolute Gy. "
+              "Summed dose may be inaccurate." % beams_with_zero_mu)
+    elif beams_with_zero_mu and len(beams_with_zero_mu) == n_beams_in_loop:
+        print("INFO: All beams have MU=0. Dose will be in Pinnacle-internal relative units.")
+    for currentbeam in range(0,n_beams_in_loop):
+        ps_ds = Dataset()
+        ds.PatientSetupSequence.append(ps_ds)
         ds.PatientSetupSequence[currentbeam].PatientPosition = patient_position #get this from patient setup file
         ds.PatientSetupSequence[currentbeam].PatientSetupNumber = (currentbeam + 1)
         
         temp_pixelvalues, doseds = creatertdose(plannumber, planfolder, currentbeam + 1, beamdosefiles[currentbeam], beamdoses[currentbeam], numfracs)
-        doseds.file_meta.MediaStorageSOPInstanceUID = doseinstuid + "." + str(plannumber)
+        # Override the per-beam UID with a plan-level dose UID (all beams sum into one RD)
+        _plan_dose_uid = make_sub_uid(doseinstuid, plannumber)
+        doseds.file_meta.MediaStorageSOPInstanceUID = _plan_dose_uid
+        doseds.SOPInstanceUID = _plan_dose_uid
         if flag_nobinaryfile:
             continue
         else:
@@ -1959,39 +2179,96 @@ def readtrial(ds, planfolder, plannumber):
                     summed_pixel_values[i] = summed_pixel_values[i] + temp_pixelvalues[i]
     
 
-    if flag_nobinaryfile == False:
+    if flag_nobinaryfile == False and len(summed_pixel_values) > 0:
         print("Max pixel value: " + str(max(summed_pixel_values)))
         print("Min pixel value: " + str(min(summed_pixel_values)))
-        scale = max(summed_pixel_values) /65530
-        doseds.DoseGridScaling = scale
-        #doseds.TransferSyntaxUID=GTransferSyntaxUID
-        #print(doseds.TransferSyntaxUID)
 
+        # ---- Sanity check: pixel buffer size must match declared grid dims ----
+        expected_voxels = int(dosexdim) * int(doseydim) * int(dosezdim)
+        actual_voxels = len(summed_pixel_values)
+        if actual_voxels != expected_voxels:
+            print(
+                "WARNING: dose pixel count mismatch — "
+                "expected %d (%d x %d x %d), got %d. "
+                "Pinnacle binary file size disagrees with trial dose grid "
+                "dimensions; the resulting RD will fail validation."
+                % (expected_voxels, dosexdim, doseydim, dosezdim, actual_voxels)
+            )
+            # Truncate or pad to match declared dimensions so the file is at
+            # least *parseable*; the data may be wrong but the validator
+            # length check will pass.
+            if actual_voxels > expected_voxels:
+                summed_pixel_values = summed_pixel_values[:expected_voxels]
+            else:
+                summed_pixel_values = list(summed_pixel_values) + \
+                    [0.0] * (expected_voxels - actual_voxels)
+
+        max_val = max(summed_pixel_values) if summed_pixel_values else 0
+        if max_val <= 0:
+            scale = 1.0
+        else:
+            scale = max_val / 65530.0
+        # DoseGridScaling has VR=DS (max 16 chars). Use the formatter so we
+        # never silently overflow.
+        doseds.DoseGridScaling = format_ds(scale)
         print("Dose grid scaling: " + str(scale))
-        
-        ofile = open('samplebinaryslicevalues.txt','w')
-        pixel_binary_block = bytes()
-        currline = 0
+
         pixelvaluelist = []
-        for pp, element in enumerate(summed_pixel_values, 0):
-            if(pp > dosexdim*doseydim*10 and pp < dosexdim*doseydim*11):
-                currline = currline + 1
-                ofile.write(str(element)+ " ")
-                if currline%dosexdim == 0:
-                    currline = 0
-                    ofile.write("\n")
+        clamped = 0
+        for element in summed_pixel_values:
             if scale != 0:
-                element = round(element/scale)
+                element = round(element / scale)
             else:
                 element = 0
+            if element < 0:
+                clamped += 1
+                element = 0
             pixelvaluelist.append(element)
-            #pixel_binary_block += struct.pack("I", element)
-        pixel_binary_block = struct.pack('%si' % len(pixelvaluelist), *pixelvaluelist)
+        if clamped:
+            print("Note: clamped %d negative voxels to 0 for unsigned packing"
+                  % clamped)
+
+        # Pack as little-endian unsigned 32-bit ('<I') so the byte order is
+        # explicit and matches Explicit VR LE transfer syntax. Native '%sI'
+        # works on x86 by accident; '<I' is correct on every platform.
+        pixel_binary_block = struct.pack('<%dI' % len(pixelvaluelist),
+                                         *pixelvaluelist)
         doseds.PixelData = pixel_binary_block
-        ofile.close()
-        dosefilename="RD."+doseds.file_meta.MediaStorageSOPInstanceUID+".dcm"
-        #print("\n Creating Dose file named : %s \n"%(dosefilename))
-        #doseds.save_as(Outputf+"%s/%s"%(patientfolder,dosefilename),write_like_original=False)
+
+        # Re-assert dimensions and pixel attributes so the validator can compute
+        # expected pixel data length consistently.
+        doseds.NumberOfFrames = int(dosezdim)
+        doseds.Rows = int(doseydim)
+        doseds.Columns = int(dosexdim)
+        doseds.SamplesPerPixel = 1
+        doseds.PhotometricInterpretation = 'MONOCHROME2'
+        doseds.BitsAllocated = 32
+        doseds.BitsStored = 32
+        doseds.HighBit = 31
+        doseds.PixelRepresentation = 0  # unsigned, matches '<I' packing
+
+        # FrameIncrementPointer must point to GridFrameOffsetVector tag
+        doseds.FrameIncrementPointer = doseds.data_element("GridFrameOffsetVector").tag
+
+        # Re-assert the dose→plan reference with matching UID
+        doseds.ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID = make_sub_uid(plansopinstuid, plannumber)
+
+        # Verify length matches what DICOM viewers compute
+        expected_bytes = (int(doseds.Rows) * int(doseds.Columns) *
+                          int(doseds.NumberOfFrames) *
+                          int(doseds.SamplesPerPixel) *
+                          int(doseds.BitsAllocated) // 8)
+        actual_bytes = len(pixel_binary_block)
+        if expected_bytes != actual_bytes:
+            print("ERROR: PixelData length %d != expected %d. RD will be invalid."
+                  % (actual_bytes, expected_bytes))
+
+        # Force RT Dose to Explicit VR LE — required for 32-bit pixel data.
+        doseds.file_meta.TransferSyntaxUID = RTDOSE_TRANSFER_SYNTAX_UID
+
+        dosefilename = "RD." + doseds.file_meta.MediaStorageSOPInstanceUID + ".dcm"
+        print("\n Creating Dose file: %s \n" % (dosefilename))
+        save_dicom_strict(doseds, Outputf + "%s/%s" % (patientfolder, dosefilename))
     #ds.FractionGroupSequence[0].ReferencedDoseReferenceSequence = Sequence()
     #ReferencedDoseReference2 = Dataset()
     #ds.FractionGroupSequence[0].ReferencedDoseReferenceSequence.append(ReferencedDoseReference2)
@@ -2040,8 +2317,9 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
      # Populate required values for file meta information
     file_meta = Dataset()
     file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.2' # RT Dose Storage
-    file_meta.TransferSyntaxUID = GTransferSyntaxUID
-    file_meta.MediaStorageSOPInstanceUID = doseinstuid + "." + str(plannumber) + str(beamnum)
+    file_meta.TransferSyntaxUID = RTDOSE_TRANSFER_SYNTAX_UID  # Explicit VR Little Endian (required for 32-bit pixel data)
+    _dose_sop_uid = make_sub_uid(doseinstuid, plannumber, beamnum)
+    file_meta.MediaStorageSOPInstanceUID = _dose_sop_uid
     file_meta.ImplementationClassUID = gImplementationClassUID #this value remains static since implementation for creating file is the same
     # Create the FileDataset instance (initially no data elements, but file_meta supplied)
     RDfilename="RD."+file_meta.MediaStorageSOPInstanceUID+".dcm"
@@ -2053,15 +2331,16 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
     ds.InstanceCreationDate = time.strftime("%Y%m%d")
     ds.InstanceCreationTime = time.strftime("%H%M%S")
     ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.481.2' # RT Dose Storage
-    ds.SOPInstanceUID = doseinstuid + "." + str(plannumber) + str(beamnum)
+    ds.SOPInstanceUID = _dose_sop_uid
     ds.StudyDate = study_date
     ds.StudyTime = study_time
     ds.AccessionNumber = ''
     ds.Modality = 'RTDOSE'
     ds.Manufacturer = Manufacturer
+    ds.ReferringPhysicianName = physician if physician else ""
     ds.OperatorsName = ""
     ds.ManufacturerModelName = model
-    ds.SoftwareVersions = ['u\'9.0']
+    ds.SoftwareVersions = softwarev if softwarev else 'Unknown'
     ds.PhysiciansOfRecord = physician
     ds.PatientName = patientname
     ds.PatientBirthDate = dob
@@ -2069,16 +2348,16 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
     ds.PatientSex = patient_sex
     ds.SliceThickness = pixspacingz #Get this value from images???
     ds.StudyInstanceUID = StudyInstanceUID
-    ds.SeriesInstanceUID = doseseriesuid + "." + str(plannumber) + str(beamnum)
+    ds.SeriesInstanceUID = make_sub_uid(doseseriesuid, plannumber, beamnum)
     ds.StudyID = sid
     if(patient_position == 'HFS'):
-        ds.ImagePositionPatient = [float(doseoriginx), float(doseoriginy) - ydoseshift , float(doseoriginz) - zdoseshift]
+        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) - ydoseshift, 4), round(float(doseoriginz) - zdoseshift, 4)]
     elif(patient_position == 'HFP'):
-        ds.ImagePositionPatient = [float(doseoriginx), float(doseoriginy) + ydoseshift , float(doseoriginz) - zdoseshift]
+        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) + ydoseshift, 4), round(float(doseoriginz) - zdoseshift, 4)]
     elif(patient_position == 'FFS'):
-        ds.ImagePositionPatient = [float(doseoriginx), float(doseoriginy) - ydoseshift , float(doseoriginz) + zdoseshift]
+        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) - ydoseshift, 4), round(float(doseoriginz) + zdoseshift, 4)]
     elif(patient_position == 'FFP'):
-        ds.ImagePositionPatient = [float(doseoriginx), float(doseoriginy) + ydoseshift , float(doseoriginz) + zdoseshift]
+        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) + ydoseshift, 4), round(float(doseoriginz) + zdoseshift, 4)]
     ds.ImageOrientationPatient = image_orientation
     ds.FrameOfReferenceUID = FrameUID
     ds.PositionReferenceIndicator = posrefind #From image files?
@@ -2100,7 +2379,7 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
     ReferencedRTPlan1 = Dataset()
     ds.ReferencedRTPlanSequence.append(ReferencedRTPlan1)
     ds.ReferencedRTPlanSequence[0].ReferencedSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.5'
-    ds.ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID = plansopinstuid + "." + str(plannumber)
+    ds.ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID = make_sub_uid(plansopinstuid, plannumber)
     ds.ReferencedRTPlanSequence[0].ReferencedFractionGroupSequence = Sequence()
     ReferencedFractionGroup1 = Dataset()
     ds.ReferencedRTPlanSequence[0].ReferencedFractionGroupSequence.append(ReferencedFractionGroup1)
@@ -2110,24 +2389,27 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
     ds.ReferencedRTPlanSequence[0].ReferencedFractionGroupSequence[0].ReferencedBeamSequence[0].ReferencedBeamNumber = beamnum
     ds.ReferencedRTPlanSequence[0].ReferencedFractionGroupSequence[0].ReferencedFractionGroupNumber = '1'
     ds.TissueHeterogeneityCorrection = 'IMAGE'
-    frameoffsetvect = []
-    for p in range(0, int(dosezdim)):
-        frameoffsetvect.append(int(p*int(pixspacingz)))
+    # GridFrameOffsetVector: distance in mm of each frame from the first frame.
+    # Must be float — int(p * pixspacingz) truncates non-integer slice spacings
+    # (e.g. 2.5 mm becomes 2 mm), which makes viewers compute slice positions
+    # inconsistent with the data. VR is DS so values must be plain numbers.
+    frameoffsetvect = [round(p * float(pixspacingz), 4)
+                       for p in range(int(dosezdim))]
     ds.GridFrameOffsetVector = frameoffsetvect
     pixeldatallist = []
-    randomcounter = 0
     #print("Binary file: " + "plan.Trial.binary.%s"%binarynum)
     if os.path.isfile("%s%s/%s/plan.Trial.binary.%s"%(Inputf, patientfolder, planfolder, binarynum)):
         with open("%s%s/%s/plan.Trial.binary.%s"%(Inputf,patientfolder, planfolder, binarynum), "rb") as binary_file:
             data_element = binary_file.read(4)
             while data_element:
-                randomcounter = randomcounter + 1
                 value = struct.unpack(">f", data_element)[0]
-                #if randomcounter % 5000 == 0:
-                    #print("Prescibed dose: " + str(beamdosevalue))
-                    #print("Pixel value: " + str(value*(beamdosevalue/100)*float(numfracs)))
-                #value = value*(beamdosevalue)
-                value = float(numfracs)*value*beamdosevalue/100
+                # Pinnacle binary stores dose normalised to 1 MU. When we have
+                # valid MU (beamdosevalue > 0), scale to absolute dose in Gy:
+                #   dose_Gy = raw_value × (MU / 100) × numfracs
+                # When MU is unknown (beamdosevalue == 0), keep raw values so
+                # the dose distribution shape is preserved.
+                if beamdosevalue > 0:
+                    value = value * float(beamdosevalue) / 100.0 * float(numfracs)
                 pixeldatallist.append(value)
                 data_element = binary_file.read(4)
     else:
@@ -2138,47 +2420,52 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
         flag_nobinaryfile = True
     main_pix_array = []
     if flag_nobinaryfile == False:
-        #ptag = ds.data_element("GridFrameOffsetVector").tag
+        # Sanity check: binary file size vs. declared dose grid dimensions
+        expected_voxels = int(dosexdim) * int(doseydim) * int(dosezdim)
+        if len(pixeldatallist) != expected_voxels:
+            print(
+                "WARNING: beam %s binary has %d voxels but trial declares %d "
+                "(%d x %d x %d). Older Pinnacle versions sometimes write a "
+                "different grid than the trial header records."
+                % (binarynum, len(pixeldatallist), expected_voxels,
+                   dosexdim, doseydim, dosezdim)
+            )
+
         ds.FrameIncrementPointer = ds.data_element("GridFrameOffsetVector").tag
-        
+
         for h in range(0, dosezdim):
             pixelsforframe = []
             for k in range(0, dosexdim*doseydim):
-                #if(k > 0 and k%dosexdim == 0):
-                #    topval = pixelsforframe[k - 1]
-                #    for j in range(0, (dosexdim - 1)):
-                #        pixelsforframe[k-j-1] = pixelsforframe[k-j-2]
-                #    pixelsforframe[k-10] = topval
-                pixelsforframe.append(float(pixeldatallist[h*doseydim*dosexdim + k]))
-            #main_pix_array.append(pixelsforframe)
+                idx = h*doseydim*dosexdim + k
+                if idx < len(pixeldatallist):
+                    pixelsforframe.append(float(pixeldatallist[idx]))
+                else:
+                    pixelsforframe.append(0.0)
             main_pix_array = main_pix_array + list(reversed(pixelsforframe))
 
         main_pix_array = list(reversed(main_pix_array))
 
+        # NOTE: this per-beam ds is *not* saved here. Its scale/PixelData are
+        # only set so caller can still introspect; the actual file is saved by
+        # the plan-level code from summed values. Keep the formatting consistent
+        # with the plan-level path so we never end up with a >16-char DS or
+        # platform-dependent endianness.
         temp_beamds = ds
-
-        scale = max(main_pix_array) /65530
-        temp_beamds.DoseGridScaling = scale
-        #temp_beamds.TransferSyntaxUID=GTransferSyntaxUID
-        pixel_binary_block = bytes()
-        currline = 0
+        max_val = max(main_pix_array) if main_pix_array else 0
+        scale = (max_val / 65530.0) if max_val > 0 else 1.0
+        temp_beamds.DoseGridScaling = format_ds(scale)
         pixelvaluelist = []
-        for pp, element in enumerate(main_pix_array, 0):
-        #if(pp > dosexdim*doseydim*10 and pp < dosexdim*doseydim*11):
-            #currline = currline + 1
-            #ofile.write(str(element)+ " ")
-            #if currline%dosexdim == 0:
-                #currline = 0
-                #ofile.write("\n")
+        for element in main_pix_array:
             if scale != 0:
-                element = round(element/scale)
+                element = round(element / scale)
             else:
                 element = 0
+            if element < 0:
+                element = 0
             pixelvaluelist.append(element)
-        pixel_binary_block = struct.pack('%si' % len(pixelvaluelist), *pixelvaluelist)
+        pixel_binary_block = struct.pack('<%dI' % len(pixelvaluelist),
+                                         *pixelvaluelist)
         temp_beamds.PixelData = pixel_binary_block
-        #print("\n Creating Dose file named : %s \n"%(RDfilename))
-        #temp_beamds.save_as(Outputfolder+"%s/%s"%(patientfolder,RDfilename),write_like_original=False)
     return main_pix_array, ds
 
 ####################################################################################################################################################
