@@ -33,6 +33,55 @@ from random import randint
 from datetime import datetime
 #from PIL import Image
 
+_LOCK_RE = re.compile(
+    r"locked\s+by\s+(?P<initials>\S+?)\s*@\s*"
+    r"with\s+user\s+name\s+(?P<username>\S+?)\s*@\s*"
+    r"at\s+(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+    re.IGNORECASE,
+)
+
+def append_pinnacle_metadata(existing_description, plan_info, trial_info,
+                            total_trials, max_length=1024):
+    lock_str = (plan_info.get("PlanLockStatus") or "").strip()
+    if not lock_str:
+        lock_summary = "unlocked"
+    else:
+        m = _LOCK_RE.search(lock_str)
+        if m:
+            lock_summary = "locked by %s/%s at %s" % (
+                m.group("initials"), m.group("username"), m.group("timestamp"))
+        else:
+            lock_summary = "locked: %s" % lock_str[:80]
+
+    is_locked = bool(lock_str)
+    if not is_locked:
+        classification = "unknown"
+    elif total_trials == 1:
+        classification = "clinical"
+    else:
+        classification = ("clinical" if trial_info.get("UseTrialForTreatment", 0)
+                            else "unknown")
+
+    suffix = "Pinnacle: %s; %s" % (lock_summary, classification)
+    base = (existing_description or "").strip()
+    combined = "%s | %s" % (base, suffix) if base else suffix
+    if len(combined) > max_length:
+        combined = combined[:max_length - 3].rstrip() + "..."
+    return combined
+
+
+def _extract_use_trial_for_treatment(trial_lines):
+    """Extract UseTrialForTreatment value from raw trial text lines.
+
+    Returns 1 if the trial is flagged for treatment, 0 otherwise.
+    """
+    for line in trial_lines:
+        if "UseTrialForTreatment" in line:
+            m = re.findall(r"[-+]?\d*\.\d+|\d+", line)
+            if m:
+                return int(float(m[0]))
+    return 0
+
 ####################################################################################################################################################
 #  Global Variables
 ####################################################################################################################################################
@@ -180,11 +229,117 @@ def save_dicom_strict(ds, path):
 
 
 ####################################################################################################################################################
+# Plan filtering helpers
+####################################################################################################################################################
+
+def _read_plan_lock_status(inputf, patientfolder, plan_dir):
+    """Read PlanLockStatus from a plan.PlanInfo file. Returns raw string or ''."""
+    info_path = "%s%s/%s/plan.PlanInfo" % (inputf, patientfolder, plan_dir)
+    if not os.path.isfile(info_path):
+        return ""
+    try:
+        with open(info_path, "rt", encoding="latin1") as f:
+            for line in f:
+                if "PlanLockStatus" in line:
+                    m = re.findall(r'"([^"]*)"', line)
+                    if m:
+                        return m[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _plan_has_dose_binaries(inputf, patientfolder, plan_dir):
+    """Check whether a plan directory contains any plan.Trial.binary.* files."""
+    plan_path = "%s%s/%s" % (inputf, patientfolder, plan_dir)
+    if not os.path.isdir(plan_path):
+        return False
+    for fname in os.listdir(plan_path):
+        if fname.startswith("plan.Trial.binary."):
+            return True
+    return False
+
+
+####################################################################################################################################################
+# Trial splitting and per-trial state management
+####################################################################################################################################################
+
+def _split_trial_file(inputf, patientfolder, plan_dir):
+    """Read plan.Trial and split into separate trial blocks.
+
+    Returns a list of (trial_name, line_list) tuples.
+    If the file has one trial, returns a single-element list.
+    If the file is missing, returns an empty list.
+    """
+    trial_path = "%s%s/%s/plan.Trial" % (inputf, patientfolder, plan_dir)
+    if not os.path.isfile(trial_path):
+        return []
+
+    with open(trial_path, "rt", encoding="latin1") as f:
+        all_lines = f.readlines()
+
+    # Find the start indices of each "Trial ={" block
+    trial_starts = [i for i, line in enumerate(all_lines)
+                    if line.strip().startswith("Trial ={")]
+    if not trial_starts:
+        # No trial blocks found — return entire file as one block
+        return [("Trial_0", all_lines)]
+
+    # Split into blocks: each block runs from one "Trial ={" to the next
+    blocks = []
+    for idx, start in enumerate(trial_starts):
+        end = trial_starts[idx + 1] if idx + 1 < len(trial_starts) else len(all_lines)
+        block_lines = all_lines[start:end]
+        # Try to extract trial name from the block
+        trial_name = "Trial_%d" % idx
+        for line in block_lines:
+            if "  Name = " in line:
+                m = re.findall(r'"([^"]*)"', line)
+                if m:
+                    trial_name = m[0]
+                break
+        blocks.append((trial_name, block_lines))
+
+    return blocks
+
+
+def _reset_per_trial_globals():
+    """Reset global variables that are set per-trial inside readtrial."""
+    global beamdosefiles, dosexdim, doseydim, dosezdim
+    global doseoriginx, doseoriginy, doseoriginz
+    global pixspacingx, pixspacingy, pixspacingz
+    global numfracs, flag_nobinaryfile, no_beams
+
+    beamdosefiles = []
+    dosexdim = 0
+    doseydim = 0
+    dosezdim = 0
+    doseoriginx = ""
+    doseoriginy = ""
+    doseoriginz = ""
+    pixspacingx = ""
+    pixspacingy = ""
+    pixspacingz = ""
+    numfracs = ""
+    flag_nobinaryfile = False
+    no_beams = False
+
+
+####################################################################################################################################################
 # Function: main
 # This main function is what should be called to run program
-# The name of the patient folder should be passed into the function for it to be run. This folder should be stored under Inputf directory (line 102)
+# The name of the patient folder should be passed into the function for it to be run.
+#
+# Parameters:
+#   plan_allowlist: if not None, only export plans whose name is in this list
+#   skip_no_dose: if True, skip plans that have no dose binary files
+#
+# Returns:
+#   dict with keys: "software_version", "plans_exported", "plans_skipped",
+#                   "skip_reasons" (list of str)
 ####################################################################################################################################################
-def main(temppatientfolder,inputfolder,outputfolder):
+def main(temppatientfolder, inputfolder, outputfolder,
+         plan_allowlist=None, skip_no_dose=False):
     global ROI_COUNT
     global structfilename
     global SeriesUID
@@ -356,40 +511,129 @@ def main(temppatientfolder,inputfolder,outputfolder):
     #structfilepath=outputfolder + patientfolder + "/" + structfilename
     #structds.save_as("structfilepath")
     #print("Structure file being saved\n")
-    structds.save_as(Outputf + "/%s/%s"%(patientfolder, structfilename), write_like_original=False )
+    structds.save_as(Outputf + "/%s/%s"%(patientfolder, structfilename), enforce_file_format=True)
     
     #print(structds)
     #exit()
     doseseriesuid = pydicom.uid.generate_uid()
-    #print("creating plan data structures \n")
-    
+
     #############################################################################################
+    # Plan filtering: pre-scan to determine which plans to export
+    plans_exported = 0
+    plans_skipped = 0
+    skip_reasons = []
+
     # loop below creates plan files for each plan in directory (based on what is in the Patient file)
     for i in range(0, plancount): 
-        no_beams = False  # Reset per plan — one plan having no beams shouldn't skip the rest
         planame = plannamelist[i]
         plandirect = "Plan_" + planids[i]
+
+        # --- Plan filtering ---
+        if plan_allowlist is not None:
+            if planame not in plan_allowlist:
+                reason = "Plan '%s' (%d/%d): skipped — not in selected plans" % (planame, i+1, plancount)
+                print(reason)
+                skip_reasons.append(reason)
+                plans_skipped += 1
+                continue
+
+        if skip_no_dose:
+            if not _plan_has_dose_binaries(Inputf, patientfolder, plandirect):
+                reason = "Plan '%s' (%d/%d): skipped — no dose binaries (skip_no_dose=True)" % (planame, i+1, plancount)
+                print(reason)
+                skip_reasons.append(reason)
+                plans_skipped += 1
+                continue
+
         if i < len(planimagesets):
             imagesetnumber = planimagesets[i]
-        plands = createplands(i)
-        plands = planinit(plands, planame, plandirect, i)
-        plands = readtrial(plands, plandirect, i)
-        if no_beams == True:
+
+        # Split plan.Trial into individual trial blocks
+        trial_blocks = _split_trial_file(Inputf, patientfolder, plandirect)
+        if not trial_blocks:
+            reason = "Plan '%s' (%d/%d): skipped — plan.Trial not found" % (planame, i+1, plancount)
+            print(reason)
+            skip_reasons.append(reason)
+            plans_skipped += 1
             continue
 
-        tempmetainstuid = make_sub_uid(plansopinstuid, i)
+        if len(trial_blocks) > 1:
+            print("Plan '%s' (%d/%d): %d trials found — exporting each separately" % (
+                planame, i+1, plancount, len(trial_blocks)))
 
-        planfilename = 'RP.' + tempmetainstuid + '.dcm'
+        # Read plan lock status once per plan (shared across all trials)
+        plan_lock_str = _read_plan_lock_status(Inputf, patientfolder, plandirect)
 
-        planfilepath=Outputf + patientfolder + "/" + planfilename
+        plan_had_export = False
+        for trial_idx, (trial_name, trial_lines) in enumerate(trial_blocks):
+            # UID index: for single-trial plans use the plan index directly
+            # (backward compatible — same UIDs as before). For multi-trial,
+            # use a composite index to ensure uniqueness across trials.
+            if len(trial_blocks) == 1:
+                uid_idx = i
+            else:
+                uid_idx = i * 100 + trial_idx
 
-        save_dicom_strict(plands, planfilepath)
+            _reset_per_trial_globals()
+
+            trial_label = "'%s' trial '%s'" % (planame, trial_name) if len(trial_blocks) > 1 else "'%s'" % planame
+
+            plands = createplands(uid_idx)
+            plands = planinit(plands, planame, plandirect, uid_idx)
+
+            # Stamp RTPlanDescription with lock status and trial classification
+            # (matches the modern converter's output from pinnacle_metadata.py)
+            use_for_treatment = _extract_use_trial_for_treatment(trial_lines)
+            synthetic_plan_info = {"PlanLockStatus": plan_lock_str}
+            synthetic_trial_info = {"UseTrialForTreatment": use_for_treatment}
+            plands.RTPlanDescription = append_pinnacle_metadata(
+                descrip, synthetic_plan_info, synthetic_trial_info,
+                len(trial_blocks), max_length=1024,
+            )
+
+            plands = readtrial(plands, plandirect, uid_idx, trial_lines=trial_lines)
+
+            if no_beams:
+                reason = "Plan %s (%d/%d): skipped — no beams in trial" % (trial_label, i+1, plancount)
+                print(reason)
+                skip_reasons.append(reason)
+                continue
+
+            # Skip writing RTPLAN if the trial had beams but all dose
+            # binaries were missing — readtrial already skipped the dose
+            # file, so writing only an RTPLAN would produce an orphaned
+            # file with no matching RTDOSE.  Only enforced when the caller
+            # requested skip_no_dose; without it, the original behaviour
+            # (partial exports) is preserved.
+            if skip_no_dose and flag_nobinaryfile:
+                reason = "Plan %s (%d/%d): skipped — no dose binaries for any beam in trial" % (trial_label, i+1, plancount)
+                print(reason)
+                skip_reasons.append(reason)
+                continue
+
+            tempmetainstuid = make_sub_uid(plansopinstuid, uid_idx)
+            planfilename = 'RP.' + tempmetainstuid + '.dcm'
+            planfilepath = Outputf + patientfolder + "/" + planfilename
+
+            save_dicom_strict(plands, planfilepath)
+            plan_had_export = True
+            print("Exported RTPlan for plan %s" % trial_label)
+
+        if plan_had_export:
+            plans_exported += 1
+        else:
+            plans_skipped += 1
+
+    print("Export summary: %d/%d plans exported, %d skipped" % (plans_exported, plancount, plans_skipped))
 
     os.rename(Outputf+'%s'% patientfolder, Outputf+'%s,%s,%s'%(lname,fname,pid))
-    #print("\n \n Current software versions found: \n")
-    #for ver in softwarev:
-        #print(ver)
-    return softwarev
+
+    return {
+        "software_version": softwarev,
+        "plans_exported": plans_exported,
+        "plans_skipped": plans_skipped,
+        "skip_reasons": skip_reasons,
+    }
 ####################################################################################################################################################
 ####################################################################################################################################################
 
@@ -594,7 +838,7 @@ def convertimages():
         file_meta.MediaStorageSOPInstanceUID = tempinstuid
         file_meta.ImplementationClassUID = gImplementationClassUID
         imageds.file_meta = file_meta
-        imageds.save_as(Outputf+"%s/CT.%s.dcm"%(patientfolder, tempinstuid), write_like_original=False)
+        imageds.save_as(Outputf+"%s/CT.%s.dcm"%(patientfolder, tempinstuid), enforce_file_format=True)
         #print("Current image: ", file)
         #print(imageds)
 ####################################################################################################################################################
@@ -735,7 +979,7 @@ def createimagefiles():
                 posrefind = ds.PositionReferenceIndicator
                 #print("Creating image: " + Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid))
                 #ds.save_as(Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid),write_like_original=False)
-                ds.save_as(Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid), write_like_original=False)
+                ds.save_as(Outputf + "%s/CT.%s.dcm"%(patientfolder, instuid), enforce_file_format=True)
                 curframe = curframe + 1
 ####################################################################################################################################################
 ####################################################################################################################################################
@@ -1055,14 +1299,15 @@ def readpatientinfo(ds):
     global softwarev
     #global listofversions
     patient_path = "%s%s/Patient"%(Inputf, patientfolder)
+    pinnacle_internal_id = ""
     if not os.path.isfile(patient_path):
         print("Error: Patient file not found at %s, cannot continue." % patient_path)
         return ds
     with open(patient_path, "rt", encoding='latin1') as g: 
         for line in g:
             if "PatientID =" in line:
-                pid = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
-                ds.PatientID = pid #may want to change pid to be value of medical record number.
+                # Pinnacle internal ID — kept for reference but NOT used as DICOM PatientID.
+                pinnacle_internal_id = re.findall(r"[-+]?\d*\.\d+|\d+", line)[0]
             if "LastName = " in line:
                 lname = re.findall(r'"([^"]*)"', line)[0]
                 lname = lname.replace(' (restored)', '')
@@ -1078,7 +1323,9 @@ def readpatientinfo(ds):
                 mname = mname.replace("\\", '')
                 mname = mname.replace('/', '')
             if "MedicalRecordNumber =" in line:
-                medrecnum = re.findall(r'"([^"]*)"', line)[0] 
+                medrecnum = re.findall(r'"([^"]*)"', line)[0]
+                pid = medrecnum
+                ds.PatientID = pid
             if "ReferringPhysician = " in line:
                 refphys = re.findall(r'"([^"]*)"', line)[0]
                 ds.ReferringPhysicianName = refphys
@@ -1151,6 +1398,12 @@ def readpatientinfo(ds):
                     #listofversions.append(softwarev)
     ds.StructureSetName = 'POIandROI'
     ds.SeriesNumber = '1'
+    # Safety fallback: if MedicalRecordNumber was missing, use Pinnacle internal ID
+    if not pid and pinnacle_internal_id:
+        print("WARNING: MedicalRecordNumber not found in Patient file — "
+              "falling back to Pinnacle internal PatientID: %s" % pinnacle_internal_id)
+        pid = pinnacle_internal_id
+        ds.PatientID = pid
     patientname = lname + "^" + fname + "^" + mname + "^"
     ds.PatientName = patientname
     #print(ds)
@@ -1539,7 +1792,7 @@ def getpatientsetup(planfolder):
 # Function: readtrial()
 # purpose: get Beam information from plan.Trial for RT plan file
 ####################################################################################################################################################
-def readtrial(ds, planfolder, plannumber):
+def readtrial(ds, planfolder, plannumber, trial_lines=None):
     #print("There is a problem somewhere in this function\n")
     global isocenter
     global xshift
@@ -1594,22 +1847,23 @@ def readtrial(ds, planfolder, plannumber):
     FractionGroup1 = Dataset() #I'm assuming here I only need one data set in fraction goup sequence
     ds.FractionGroupSequence.append(FractionGroup1)
     ds.FractionGroupSequence[0].ReferencedBeamSequence = Sequence()
-    trial_path = "%s%s/%s/plan.Trial"%(Inputf, patientfolder, planfolder)
-    if not os.path.isfile(trial_path):
-        print("Warning: plan.Trial not found at %s, skipping plan." % trial_path)
-        no_beams = True
-        return ds
-    tempfile = open(trial_path, "rt", encoding='latin1')
-    all_lines = tempfile.readlines() #this is a big waste of space, there is probably a better way to do this, but it will work for now
-    tempfile.close()
-    num_trials = all_lines.count("Trial ={\n")
-    if num_trials > 1:
-        #for i in range(0, num_trials):
-            #if re.findall(r"[-+]?\d*\.\d+|\d+", next((s for s in all_lines if " UseTrialForTreatment" in s), None))[0] == '0':
-                #linetostart = all_lines[1:].index("Trial ={\n") + 1
-                #all_lines = all_lines[linetostart:]
-        linetostart = all_lines[1:].index("Trial ={\n") + 1
-        all_lines = all_lines[:linetostart] #take first trial for now
+
+    # Use pre-split trial lines if provided, otherwise read the file
+    if trial_lines is not None:
+        all_lines = trial_lines
+    else:
+        trial_path = "%s%s/%s/plan.Trial"%(Inputf, patientfolder, planfolder)
+        if not os.path.isfile(trial_path):
+            print("Warning: plan.Trial not found at %s, skipping plan." % trial_path)
+            no_beams = True
+            return ds
+        tempfile = open(trial_path, "rt", encoding='latin1')
+        all_lines = tempfile.readlines()
+        tempfile.close()
+        num_trials = all_lines.count("Trial ={\n")
+        if num_trials > 1:
+            linetostart = all_lines[1:].index("Trial ={\n") + 1
+            all_lines = all_lines[:linetostart] #take first trial for backwards compat
     #with open("%s%s/%s/plan.Trial"%(Inputf, patientfolder, planfolder), "rt", encoding='latin1') as h:
         #for linenum, line in enumerate(h,0):
     for linenum, line in enumerate(all_lines, 0):
