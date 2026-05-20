@@ -260,6 +260,55 @@ def _plan_has_dose_binaries(inputf, patientfolder, plan_dir):
     return False
 
 
+_LOCK_TS_RE_LEGACY = re.compile(
+    r"at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.IGNORECASE
+)
+
+
+def _get_plan_lock_timestamp(inputf, patientfolder, plan_dir):
+    """Read the lock timestamp from plan.PlanInfo, or return None."""
+    plan_info_path = "%s%s/%s/plan.PlanInfo" % (inputf, patientfolder, plan_dir)
+    if not os.path.isfile(plan_info_path):
+        return None
+    try:
+        with open(plan_info_path, "rt", encoding="latin1") as f:
+            for line in f:
+                if "PlanLockStatus" in line:
+                    m = re.search(r'"([^"]*)"', line)
+                    if m:
+                        ts_m = _LOCK_TS_RE_LEGACY.search(m.group(1))
+                        return ts_m.group(1) if ts_m else None
+    except Exception:
+        pass
+    return None
+
+
+def _plan_in_allowlist_legacy(plan_name, plan_lock_ts, allowlist):
+    """Check if a plan matches any entry in the allowlist.
+
+    Supports both plain-string entries (name-only) and dict entries
+    with 'name' and 'lock_timestamp' keys.
+
+    Matching rules for dict entries (after name matches):
+      - entry ts=None, plan ts=None  → match  (both unlocked)
+      - entry ts=None, plan ts=X     → no match  (unlocked entry ≠ locked plan)
+      - entry ts=X,    plan ts=X     → match  (same lock)
+      - entry ts=X,    plan ts=None  → no match  (locked entry ≠ unlocked plan)
+      - entry ts=X,    plan ts=Y     → no match  (different locks)
+    """
+    for entry in allowlist:
+        if isinstance(entry, str):
+            if plan_name == entry:
+                return True
+        elif isinstance(entry, dict):
+            if entry.get("name") != plan_name:
+                continue
+            entry_ts = entry.get("lock_timestamp")
+            if entry_ts == plan_lock_ts:
+                return True
+    return False
+
+
 ####################################################################################################################################################
 # Trial splitting and per-trial state management
 ####################################################################################################################################################
@@ -331,7 +380,9 @@ def _reset_per_trial_globals():
 # The name of the patient folder should be passed into the function for it to be run.
 #
 # Parameters:
-#   plan_allowlist: if not None, only export plans whose name is in this list
+#   plan_allowlist: if not None, only export plans matching entries in this
+#                   list.  Entries may be plain strings (name-only) or dicts
+#                   with 'name' and 'lock_timestamp' keys for disambiguation.
 #   skip_no_dose: if True, skip plans that have no dose binary files
 #
 # Returns:
@@ -530,7 +581,8 @@ def main(temppatientfolder, inputfolder, outputfolder,
 
         # --- Plan filtering ---
         if plan_allowlist is not None:
-            if planame not in plan_allowlist:
+            plan_lock_ts = _get_plan_lock_timestamp(Inputf, patientfolder, plandirect)
+            if not _plan_in_allowlist_legacy(planame, plan_lock_ts, plan_allowlist):
                 reason = "Plan '%s' (%d/%d): skipped — not in selected plans" % (planame, i+1, plancount)
                 print(reason)
                 skip_reasons.append(reason)
@@ -2609,9 +2661,11 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
     elif(patient_position == 'HFP'):
         ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) + ydoseshift, 4), round(float(doseoriginz) - zdoseshift, 4)]
     elif(patient_position == 'FFS'):
-        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) - ydoseshift, 4), round(float(doseoriginz) + zdoseshift, 4)]
+        # For feet-first the dose origin (after sign conversion) is already
+        # at the IPP corner — no z-shift needed.
+        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) - ydoseshift, 4), round(float(doseoriginz), 4)]
     elif(patient_position == 'FFP'):
-        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) + ydoseshift, 4), round(float(doseoriginz) + zdoseshift, 4)]
+        ds.ImagePositionPatient = [round(float(doseoriginx), 4), round(float(doseoriginy) + ydoseshift, 4), round(float(doseoriginz), 4)]
     ds.ImageOrientationPatient = image_orientation
     ds.FrameOfReferenceUID = FrameUID
     ds.PositionReferenceIndicator = posrefind #From image files?
@@ -2647,8 +2701,14 @@ def creatertdose(plannumber, planfolder, beamnum, binarynum, beamdosevalue, numf
     # Must be float — int(p * pixspacingz) truncates non-integer slice spacings
     # (e.g. 2.5 mm becomes 2 mm), which makes viewers compute slice positions
     # inconsistent with the data. VR is DS so values must be plain numbers.
-    frameoffsetvect = [round(p * float(pixspacingz), 4)
-                       for p in range(int(dosezdim))]
+    # For feet-first orientations the frame normal is -z, so offsets are
+    # negative (frames still march from lower to higher z in patient coords).
+    if patient_position in ('FFS', 'FFP'):
+        frameoffsetvect = [round(-p * float(pixspacingz), 4)
+                           for p in range(int(dosezdim))]
+    else:
+        frameoffsetvect = [round(p * float(pixspacingz), 4)
+                           for p in range(int(dosezdim))]
     ds.GridFrameOffsetVector = frameoffsetvect
     pixeldatallist = []
     #print("Binary file: " + "plan.Trial.binary.%s"%binarynum)
